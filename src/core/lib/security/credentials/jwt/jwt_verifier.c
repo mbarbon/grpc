@@ -50,6 +50,31 @@
 #include "src/core/lib/support/string.h"
 #include "src/core/lib/tsi/ssl_types.h"
 
+/* --- OpenSSL helpers. --- */
+
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
+int RSA_set0_key(RSA *rsa, BIGNUM *n, BIGNUM *e, BIGNUM *d) {
+  if (n != NULL) {
+    BN_free(rsa->n);
+    rsa->n = n;
+  }
+
+  if (e != NULL) {
+    BN_free(rsa->e);
+    rsa->e = e;
+  }
+
+  if (d != NULL) {
+    /* This path not actually used in this file, but included for
+       completeness. */
+    BN_free(rsa->d);
+    rsa->d = d;
+  }
+
+  return 1;
+}
+#endif
+
 /* --- Utils. --- */
 
 const char *grpc_jwt_verifier_status_to_string(
@@ -484,6 +509,8 @@ static EVP_PKEY *pkey_from_jwk(grpc_exec_ctx *exec_ctx, const grpc_json *json,
   const grpc_json *key_prop;
   RSA *rsa = NULL;
   EVP_PKEY *result = NULL;
+  BIGNUM *n = NULL;
+  BIGNUM *e = NULL;
 
   GPR_ASSERT(kty != NULL && json != NULL);
   if (strcmp(kty, "RSA") != 0) {
@@ -497,24 +524,30 @@ static EVP_PKEY *pkey_from_jwk(grpc_exec_ctx *exec_ctx, const grpc_json *json,
   }
   for (key_prop = json->child; key_prop != NULL; key_prop = key_prop->next) {
     if (strcmp(key_prop->key, "n") == 0) {
-      rsa->n =
-          bignum_from_base64(exec_ctx, validate_string_field(key_prop, "n"));
-      if (rsa->n == NULL) goto end;
+      n = bignum_from_base64(exec_ctx, validate_string_field(key_prop, "n"));
+      if (n == NULL) goto end;
     } else if (strcmp(key_prop->key, "e") == 0) {
-      rsa->e =
-          bignum_from_base64(exec_ctx, validate_string_field(key_prop, "e"));
-      if (rsa->e == NULL) goto end;
+      e = bignum_from_base64(exec_ctx, validate_string_field(key_prop, "e"));
+      if (e == NULL) goto end;
     }
   }
-  if (rsa->e == NULL || rsa->n == NULL) {
+  if (e == NULL || n == NULL) {
     gpr_log(GPR_ERROR, "Missing RSA public key field.");
     goto end;
   }
+  if (!RSA_set0_key(rsa, n, e, NULL)) {
+    gpr_log(GPR_ERROR, "Could not update RSA public key fields.");
+    goto end;
+  }
+  n = e = NULL; /* Now owned by the RSA object. */
+
   result = EVP_PKEY_new();
   EVP_PKEY_set1_RSA(result, rsa); /* uprefs rsa. */
 
 end:
   if (rsa != NULL) RSA_free(rsa);
+  if (n != NULL) BN_free(n);
+  if (e != NULL) BN_free(e);
   return result;
 }
 
